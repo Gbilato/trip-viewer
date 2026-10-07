@@ -14,6 +14,13 @@ npm run tauri build
 # Type-check TypeScript
 npx tsc --noEmit
 
+# Frontend tests (vitest; tests are colocated as *.test.ts)
+npm test
+npx vitest run src/utils/speedCurve.test.ts   # single file
+
+# Cut a release (see RELEASING.md)
+npm run release
+
 # Rust tests (35+ unit tests, mostly in src-tauri/src/import/ and src-tauri/src/scan/)
 cargo test --manifest-path src-tauri/Cargo.toml
 
@@ -35,6 +42,11 @@ Trip Viewer is a **Tauri v2** desktop app: Rust backend (`src-tauri/src/`) commu
 - **`metadata/`** — MP4 probe using the `mp4` crate (pure Rust, **no ffprobe dependency** — this is a locked decision, see DESIGN.md).
 - **`import/`** — SD card import pipeline (10 submodules). **Safety-critical**: files are SHA-256 hashed during copy, re-hashed on the destination, and the source is only wiped after every file is verified. See "Import pipeline invariants" below.
 - **`timelapse/`** — background ffmpeg-driven pre-render pipeline that produces 8x / 16x / 60x fast-playback MP4s per (trip, tier, channel). ffmpeg is an opt-in user dependency (configured via the `settings` table, not bundled). NVENC + NVDEC path is used when available; see `ffmpeg.rs::Encoder::needs_cuda_hwaccel`. **Event-detection thresholds for the variable-speed 16x/60x tiers live in `events.rs` — see that module's top-of-file doc comment for how to verify the slowdown behavior after a run and how to tune thresholds.**
+- **`db/`** — per-archive SQLite (`rusqlite` + `rusqlite_migration`; SQL in `db/migrations/NNNN_*.sql`, add new numbered files). The DB lives at `<archive_root>/.tripviewer/tripviewer.db` so metadata travels with the drive. **Path columns are stored relative to the archive root**; always convert via `crate::paths`, never store absolute paths.
+- **`archive.rs`** — `ArchiveSlot` holds the currently-open archive's `DbHandle` (or `None` = empty state). Switching archives swaps the slot; in-flight workers keep their old `Arc` handle and finish against the old DB. `migration_v2.rs` moves the legacy `app_data_dir` DB into the archive; `startup.rs` runs heavy startup work (GPS backfill, stale-job recovery) on a background thread behind a frontend splash (`startup:*` events).
+- **`scans/`** — post-import video analysis. Each `Scan` (audio RMS, stationary GPS, place matching, coverage…) emits descriptive tags persisted via `tags/` and shown in timeline bands/Review. Distinct from `scan/` (folder scanner).
+- **`trips/`** — manual trip merge (`merge.rs`). Merges are recorded in `manual_trip_merges` so they survive a rescan; it hard-blocks merges that would lose archive-only data. Also see `places/` and `tags/`.
+- **`video_server.rs`** — localhost HTTP Range server used for `<video>` on Linux/macOS (WebKitGTK/WKWebView can't play `asset://`). Windows uses Tauri's asset protocol.
 - **`error.rs`** — `AppError` enum with `thiserror`; implements `Serialize` for automatic JSON conversion to the frontend.
 
 ### Frontend structure
@@ -81,6 +93,7 @@ The import pipeline emits 5 event types via `app.emit()`. Progress events are **
 
 ## Related documents
 
+- **TIMELAPSE_ALIGNMENT_REDESIGN.md** — implemented design: per-channel timelapse alignment is playback metadata, not baked black filler; read before touching timelapse concat or player timing
 - **DESIGN.md** — architecture decisions, ruled-out options, tech stack, future roadmap
 - **RELEASING.md** — how to cut a release, version bumping, GitHub Actions workflow, SignPath code signing roadmap
 - **LINUX_DEV_SETUP.md** — Linux dev environment setup (distrobox recipe for atomic distros like Bazzite/Silverblue, plus direct-install steps for Fedora/Ubuntu/Arch)
