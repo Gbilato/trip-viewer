@@ -71,6 +71,27 @@ pub struct TimelapseMergeAssessment {
     /// mismatches — the frontend surfaces a warning before the user
     /// commits.
     pub camera_kinds: Vec<String>,
+    /// Tuples where an archive-only trip (no source segments left — its
+    /// timelapse render IS the only remaining copy, nothing to rebuild
+    /// from) would lose that render under one or both merge strategies.
+    /// Non-empty means the frontend must hard-block `Merge` rather than
+    /// merely warn — `merge_trips` refuses these too, so this field
+    /// exists purely so the UI can catch it before the user ever clicks
+    /// the button. See `ArchiveOnlyRisk::blocks_concat_strategy`.
+    pub archive_only_at_risk: Vec<ArchiveOnlyRisk>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveOnlyRisk {
+    pub trip_id: String,
+    pub tier: String,
+    pub channel: String,
+    /// True when this tuple can't be losslessly concatenated (partial
+    /// coverage across sources, or non-chronological inputs) — picking
+    /// `ConcatWherePossible` would still drop it. False means the tuple
+    /// IS concat-ready, so only `DiscardAll` is unsafe for it.
+    pub blocks_concat_strategy: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,6 +117,14 @@ pub struct MergeReport {
     /// Total `timelapse_jobs` rows removed (failed concats, partial
     /// tuples, or every row when strategy is DiscardAll).
     pub timelapse_jobs_removed: usize,
+    /// Redundant on-disk files this merge left behind (concatenated
+    /// sources, discarded outputs) that were swept to trash immediately
+    /// after the merge committed, scoped to just this merge's trips.
+    /// `None` if the sweep itself failed — the merge already succeeded
+    /// by that point, so a sweep failure doesn't roll it back, but the
+    /// frontend should say "run Prune manually" rather than claim
+    /// nothing was left behind.
+    pub pruned: Option<crate::timelapse::cleanup::PruneSummary>,
 }
 
 // ── Assessment ──────────────────────────────────────────────────────
@@ -169,7 +198,7 @@ pub fn assess_timelapse_merge(
 
     let archive_root = db.archive_root().to_path_buf();
     let absorbed_strs: Vec<String> = absorbed.iter().map(|u| u.to_string()).collect();
-    let (rows, camera_kinds, is_chronological) = {
+    let (rows, camera_kinds, is_chronological, archive_only_ids) = {
         let conn = db
             .lock()
             .map_err(|_| AppError::Internal("db mutex poisoned".into()))?;
@@ -177,7 +206,8 @@ pub fn assess_timelapse_merge(
         let kinds = load_camera_kinds(&conn, &all_ids)?;
         let chrono =
             chronologically_sequential(&conn, &primary.to_string(), &absorbed_strs)?;
-        (rows, kinds, chrono)
+        let archive_only = load_archive_only_ids(&conn, &all_ids)?;
+        (rows, kinds, chrono, archive_only)
     };
 
     if rows.is_empty() {
@@ -185,6 +215,7 @@ pub fn assess_timelapse_merge(
             has_any_timelapses: false,
             tuples: Vec::new(),
             camera_kinds,
+            archive_only_at_risk: Vec::new(),
         });
     }
 
@@ -238,10 +269,14 @@ pub fn assess_timelapse_merge(
         a.tier.cmp(&b.tier).then_with(|| a.channel.cmp(&b.channel))
     });
 
+    let archive_only_at_risk =
+        compute_archive_only_risk(&rows, &absorbed_strs, is_chronological, &archive_only_ids);
+
     Ok(TimelapseMergeAssessment {
         has_any_timelapses: true,
         tuples: out,
         camera_kinds,
+        archive_only_at_risk,
     })
 }
 
@@ -292,6 +327,85 @@ fn chronologically_sequential(
         prev_end = Some(end);
     }
     Ok(true)
+}
+
+/// Trips among `trip_ids` with no rows in `segments` — originals
+/// already deleted, so any timelapse render they still have is the
+/// only remaining copy of that content. Rebuild is impossible for
+/// these; see `compute_archive_only_risk`.
+fn load_archive_only_ids(
+    conn: &Connection,
+    trip_ids: &[String],
+) -> Result<HashSet<String>, AppError> {
+    if trip_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let placeholders = std::iter::repeat_n("?", trip_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT t.id FROM trips t
+         WHERE t.id IN ({placeholders})
+           AND NOT EXISTS (SELECT 1 FROM segments s WHERE s.trip_id = t.id)"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(trip_ids.iter()), |r| {
+        r.get::<_, String>(0)
+    })?;
+    let mut out = HashSet::new();
+    for r in rows {
+        out.insert(r?);
+    }
+    Ok(out)
+}
+
+/// For every (tier, channel) tuple with at least one `done` row among
+/// `rows`, report whether an archive-only trip's render for that
+/// tuple would be destroyed by a merge — and by which strategy.
+/// `DiscardAll` throws away every row regardless of coverage, so any
+/// archive-only trip with a done row anywhere is at risk under it.
+/// `ConcatWherePossible` only drops tuples that aren't concat-ready
+/// (coverage gap or non-chronological inputs); a concat-ready tuple's
+/// content survives, folded into the primary's merged output.
+fn compute_archive_only_risk(
+    rows: &[JobRow],
+    absorbed: &[String],
+    is_chronological: bool,
+    archive_only_ids: &HashSet<String>,
+) -> Vec<ArchiveOnlyRisk> {
+    let mut tuples: HashMap<(String, String), Vec<&JobRow>> = HashMap::new();
+    for row in rows {
+        if row.status == "done" && row.output_path.is_some() {
+            tuples
+                .entry((row.tier.clone(), row.channel.clone()))
+                .or_default()
+                .push(row);
+        }
+    }
+    let total_sources = absorbed.len() + 1;
+    let mut risk = Vec::new();
+    for ((tier, channel), trip_rows) in &tuples {
+        let trip_set: HashSet<&str> =
+            trip_rows.iter().map(|r| r.trip_id.as_str()).collect();
+        let concatenable = trip_set.len() == total_sources && is_chronological;
+        for trip_row in trip_rows {
+            if archive_only_ids.contains(&trip_row.trip_id) {
+                risk.push(ArchiveOnlyRisk {
+                    trip_id: trip_row.trip_id.clone(),
+                    tier: tier.clone(),
+                    channel: channel.clone(),
+                    blocks_concat_strategy: !concatenable,
+                });
+            }
+        }
+    }
+    risk.sort_by(|a, b| {
+        a.trip_id
+            .cmp(&b.trip_id)
+            .then_with(|| a.tier.cmp(&b.tier))
+            .then_with(|| a.channel.cmp(&b.channel))
+    });
+    risk
 }
 
 fn load_camera_kinds(
@@ -367,6 +481,42 @@ pub fn merge_trips(
         load_job_rows(&conn, &all_ids, &archive_root)?
     };
 
+    // Hard guard: an archive-only trip (originals already deleted) has
+    // no source to rebuild from, so its timelapse render is the only
+    // remaining copy. Refuse the merge outright — before any ffmpeg
+    // call or DB write — if the chosen strategy would drop one of its
+    // done tuples rather than concatenate it. There is no strategy
+    // under which destroying that copy is acceptable.
+    let (is_chronological, archive_only_ids) = {
+        let conn = db
+            .lock()
+            .map_err(|_| AppError::Internal("db mutex poisoned".into()))?;
+        let chrono = chronologically_sequential(&conn, &primary_str, &absorbed_strs)?;
+        let ids = load_archive_only_ids(&conn, &all_ids)?;
+        (chrono, ids)
+    };
+    let archive_only_risk =
+        compute_archive_only_risk(&job_rows, &absorbed_strs, is_chronological, &archive_only_ids);
+    let unsafe_for_strategy: Vec<&ArchiveOnlyRisk> = archive_only_risk
+        .iter()
+        .filter(|r| match strategy {
+            TimelapseMergeStrategy::DiscardAll => true,
+            TimelapseMergeStrategy::ConcatWherePossible => r.blocks_concat_strategy,
+        })
+        .collect();
+    if !unsafe_for_strategy.is_empty() {
+        let names: Vec<String> = unsafe_for_strategy
+            .iter()
+            .map(|r| format!("{} ({}/{})", r.trip_id, r.tier, r.channel))
+            .collect();
+        return Err(AppError::Internal(format!(
+            "merge blocked: this trip's originals are already deleted, so its timelapse \
+             is the only remaining copy and can't be rebuilt — merging with the chosen \
+             strategy would destroy it for: {}",
+            names.join(", ")
+        )));
+    }
+
     // Phase 1: plan only. Runs ffmpeg concat to produce merged MP4
     // files on disk (or stages deletes for DiscardAll) but does NOT
     // touch the DB. Files that get produced here become orphans if
@@ -378,6 +528,8 @@ pub fn merge_trips(
         &job_rows,
         strategy,
         ffmpeg_path.as_deref(),
+        is_chronological,
+        &archive_only_ids,
         &mut report,
     )?;
 
@@ -418,6 +570,26 @@ pub fn merge_trips(
         tx.commit()?;
     }
 
+    // Sweep the files this merge just made redundant — concatenated
+    // sources, or discarded outputs — immediately, scoped to just this
+    // merge's trips. The archive-only guard above already ran, so
+    // every file here is provably safe to clear: either its content
+    // survives inside primary's new merged output, or the user
+    // explicitly chose to discard it for a trip that can still rebuild
+    // from originals. Best-effort: the merge already committed, so a
+    // sweep failure doesn't roll anything back, it just means the user
+    // sees these in a later manual Prune instead.
+    report.pruned =
+        match crate::timelapse::cleanup::prune_orphan_timelapse_files_for_trips(
+            db, &all_ids,
+        ) {
+            Ok(summary) => Some(summary),
+            Err(e) => {
+                eprintln!("[merge] post-merge orphan sweep failed (non-fatal): {e}");
+                None
+            }
+        };
+
     Ok(report)
 }
 
@@ -443,6 +615,7 @@ pub(crate) struct TimelapseMergePlan {
     rows_to_upsert: Vec<UpsertJob>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_timelapse_strategy(
     db: &DbHandle,
     primary: &str,
@@ -450,6 +623,8 @@ fn plan_timelapse_strategy(
     job_rows: &[JobRow],
     strategy: TimelapseMergeStrategy,
     ffmpeg_path: Option<&str>,
+    is_chronological: bool,
+    archive_only_ids: &HashSet<String>,
     report: &mut MergeReport,
 ) -> Result<TimelapseMergePlan, AppError> {
     if job_rows.is_empty() {
@@ -484,7 +659,16 @@ fn plan_timelapse_strategy(
                     "ffmpeg not configured — set the path in Timelapse settings first".into(),
                 )
             })?;
-            plan_concat_where_possible(db, primary, absorbed, job_rows, ffmpeg, report)
+            plan_concat_where_possible(
+                db,
+                primary,
+                absorbed,
+                job_rows,
+                ffmpeg,
+                is_chronological,
+                archive_only_ids,
+                report,
+            )
         }
     }
 }
@@ -550,12 +734,15 @@ fn apply_timelapse_plan_in_tx(
     Ok(deleted)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_concat_where_possible(
     db: &DbHandle,
     primary: &str,
     absorbed: &[String],
     job_rows: &[JobRow],
     ffmpeg_path: &str,
+    is_chronological: bool,
+    archive_only_ids: &HashSet<String>,
     report: &mut MergeReport,
 ) -> Result<TimelapseMergePlan, AppError> {
     // Group done rows by (tier, channel). Non-done rows are dropped
@@ -590,14 +777,10 @@ fn plan_concat_where_possible(
     // sequential merges). Drop every (tier, channel) tuple — the
     // merged trip will have no encoded timelapses until the user
     // clicks Rebuild, which re-encodes from the source segments in
-    // chronological order.
-    let chronological = {
-        let conn = db
-            .lock()
-            .map_err(|_| AppError::Internal("db mutex poisoned".into()))?;
-        chronologically_sequential(&conn, primary, absorbed)?
-    };
-    if !chronological {
+    // chronological order. (Archive-only trips can't reach this branch
+    // safely — the caller's pre-flight guard already refused the merge
+    // if one of them had a done tuple at stake here.)
+    if !is_chronological {
         eprintln!(
             "[merge] inputs interleave in time — dropping all tuples to force rebuild \
              (concat would produce out-of-order playback at the seam)"
@@ -692,6 +875,29 @@ fn plan_concat_where_possible(
                     // still has its row, so the merged trip keeps
                     // primary's existing timelapse intact rather than
                     // silently losing both the file and the row.
+                    //
+                    // Exception: if an absorbed source here is
+                    // archive-only, that dedupe-drop silently destroys
+                    // its only remaining copy — the pre-flight guard in
+                    // `merge_trips` couldn't have caught this because
+                    // it assumed a concat-ready tuple would succeed.
+                    // Fail loudly instead of losing it quietly.
+                    let unsafe_absorbed: Vec<&str> = ordered
+                        .iter()
+                        .filter(|r| {
+                            r.trip_id != primary && archive_only_ids.contains(&r.trip_id)
+                        })
+                        .map(|r| r.trip_id.as_str())
+                        .collect();
+                    if !unsafe_absorbed.is_empty() {
+                        return Err(AppError::Internal(format!(
+                            "merge blocked: ffmpeg concat failed for ({tier}, {channel}): \
+                             {e}; an archive-only trip's only remaining render for this \
+                             tuple ({}) would otherwise be silently dropped instead of \
+                             concatenated",
+                            unsafe_absorbed.join(", ")
+                        )));
+                    }
                     eprintln!(
                         "[merge] concat failed for ({tier}, {channel}): {e}; \
                          keeping primary's existing output"
@@ -1025,6 +1231,42 @@ mod tests {
         }
     }
 
+    /// Archive-only trip: has done timelapse_jobs rows but no
+    /// `segments` row, matching `load_archive_only_ids`'s definition
+    /// (originals already deleted — the render is the only remaining
+    /// copy).
+    fn seed_archive_only_trip_with_timelapses(db: &DbHandle, trip_id: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO trips (id, start_time_ms, end_time_ms, camera_kind,
+                gps_supported, last_seen_ms)
+             VALUES (?1, 0, 60000, 'wolfBox', 1, 0)",
+            params![trip_id],
+        )
+        .unwrap();
+        for tier in ["8x", "16x", "60x"] {
+            for channel in ["F", "I", "R"] {
+                crate::db::timelapse_jobs::upsert_pending(
+                    &conn, trip_id, tier, channel,
+                )
+                .unwrap();
+                crate::db::timelapse_jobs::mark_done(
+                    &conn,
+                    trip_id,
+                    tier,
+                    channel,
+                    &format!("Timelapses/{trip_id}_{tier}_{channel}.mp4"),
+                    "7.0",
+                    "hevc_nvenc",
+                    0,
+                    "[]",
+                    Some(1_000_000),
+                )
+                .unwrap();
+            }
+        }
+    }
+
     fn count_jobs(db: &DbHandle, trip_id: &str) -> i64 {
         let conn = db.lock().unwrap();
         conn.query_row(
@@ -1198,5 +1440,149 @@ mod tests {
         // a rebuild for the merged trip to have a playable timelapse.
         assert_eq!(count_jobs(&db, &a.to_string()), 0);
         assert_eq!(count_jobs(&db, &b.to_string()), 0);
+    }
+
+    /// `DiscardAll` never concatenates — it just deletes rows. For an
+    /// archive-only trip that means destroying its only remaining copy
+    /// with no way to rebuild. This must be refused outright, before
+    /// any row is touched.
+    #[test]
+    fn merge_blocks_discard_all_when_archive_only_trip_has_render() {
+        let db = open_in_memory().unwrap();
+        let primary = parse("11111111-1111-1111-1111-111111111111");
+        let archived = parse("33333333-3333-3333-3333-333333333333");
+        seed_trip_with_timelapses(&db, &primary.to_string(), "seg-primary");
+        seed_archive_only_trip_with_timelapses(&db, &archived.to_string());
+
+        let result = merge_trips(
+            &db,
+            primary,
+            &[archived],
+            TimelapseMergeStrategy::DiscardAll,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "must refuse to discard an archive-only trip's only render"
+        );
+        assert_eq!(
+            count_jobs(&db, &archived.to_string()),
+            9,
+            "archive-only trip's timelapse rows must survive a refused merge"
+        );
+        let conn = db.lock().unwrap();
+        let still_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM trips WHERE id = ?1",
+                params![archived.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_exists, 1, "archive-only trip must not be deleted");
+    }
+
+    /// `ConcatWherePossible` only preserves tuples with full coverage.
+    /// If the primary is missing a tuple that an archive-only trip
+    /// already has rendered, that tuple can't be concatenated and
+    /// would otherwise be dropped — refuse the merge instead.
+    #[test]
+    fn merge_blocks_concat_strategy_when_archive_only_trip_would_lose_partial_tuple() {
+        let db = open_in_memory().unwrap();
+        let primary = parse("11111111-1111-1111-1111-111111111111");
+        let archived = parse("33333333-3333-3333-3333-333333333333");
+        seed_trip_with_timelapses(&db, &primary.to_string(), "seg-primary");
+        seed_archive_only_trip_with_timelapses(&db, &archived.to_string());
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE trips SET start_time_ms = 0, end_time_ms = 60000 WHERE id = ?1",
+                params![primary.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE trips SET start_time_ms = 60000, end_time_ms = 120000 WHERE id = ?1",
+                params![archived.to_string()],
+            )
+            .unwrap();
+            // Primary lacks coverage for one tuple the archive-only
+            // trip has — that tuple has a coverage gap, not full
+            // coverage, so it can't be concatenated.
+            conn.execute(
+                "DELETE FROM timelapse_jobs
+                 WHERE trip_id = ?1 AND tier = '60x' AND channel = 'R'",
+                params![primary.to_string()],
+            )
+            .unwrap();
+        }
+
+        let result = merge_trips(
+            &db,
+            primary,
+            &[archived],
+            TimelapseMergeStrategy::ConcatWherePossible,
+            Some("/nonexistent-ffmpeg".into()),
+        );
+        assert!(
+            result.is_err(),
+            "must refuse to drop an archive-only trip's uncovered tuple"
+        );
+        assert_eq!(
+            count_jobs(&db, &archived.to_string()),
+            9,
+            "archive-only trip's timelapse rows must survive a refused merge"
+        );
+    }
+
+    /// Even when every tuple is fully covered and chronological (so the
+    /// guard's pre-flight check judges the merge safe), the actual
+    /// ffmpeg concat can still fail at runtime. If an archive-only
+    /// trip's row would be silently dropped by the later dedupe step in
+    /// that case, the merge must fail loudly instead of losing it.
+    #[test]
+    fn merge_fails_loudly_rather_than_silently_dropping_archive_only_trip_on_concat_failure() {
+        let db = open_in_memory().unwrap();
+        let primary = parse("11111111-1111-1111-1111-111111111111");
+        let archived = parse("33333333-3333-3333-3333-333333333333");
+        seed_trip_with_timelapses(&db, &primary.to_string(), "seg-primary");
+        seed_archive_only_trip_with_timelapses(&db, &archived.to_string());
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE trips SET start_time_ms = 0, end_time_ms = 60000 WHERE id = ?1",
+                params![primary.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE trips SET start_time_ms = 60000, end_time_ms = 120000 WHERE id = ?1",
+                params![archived.to_string()],
+            )
+            .unwrap();
+        }
+
+        // Full coverage + chronological — the pre-flight guard sees
+        // this as safe. The nonexistent ffmpeg path then fails every
+        // concat attempt at spawn time, exercising the runtime-failure
+        // fallback rather than the pre-flight guard.
+        let result = merge_trips(
+            &db,
+            primary,
+            &[archived],
+            TimelapseMergeStrategy::ConcatWherePossible,
+            Some("/nonexistent-ffmpeg".into()),
+        );
+        assert!(
+            result.is_err(),
+            "a concat failure touching an archive-only trip must surface as an error"
+        );
+        assert_eq!(
+            count_jobs(&db, &primary.to_string()),
+            9,
+            "primary's timelapse rows must survive a failed merge"
+        );
+        assert_eq!(
+            count_jobs(&db, &archived.to_string()),
+            9,
+            "archive-only trip's timelapse rows must survive a failed merge"
+        );
     }
 }

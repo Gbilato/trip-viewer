@@ -52,6 +52,19 @@ export interface TupleAssessment {
   absorbedWithOutput: string[];
 }
 
+/** A (trip, tier, channel) render that would be destroyed rather than
+ *  concatenated if the merge proceeds — for a trip whose originals are
+ *  already deleted, meaning there's no way to rebuild it afterward. */
+export interface ArchiveOnlyRisk {
+  tripId: string;
+  tier: string;
+  channel: string;
+  /** True when this tuple isn't concat-ready (coverage gap or
+   *  non-chronological inputs) — `concatWherePossible` would still
+   *  drop it. False means only `discardAll` is unsafe for it. */
+  blocksConcatStrategy: boolean;
+}
+
 export interface TimelapseMergeAssessment {
   /** False when no source trip has any timelapse_jobs row — frontend
    *  can skip the strategy dialog and merge silently. */
@@ -61,9 +74,19 @@ export interface TimelapseMergeAssessment {
    *  More than one entry means concat will fail at ffmpeg time on
    *  resolution / pix_fmt mismatches; the dialog surfaces a warning. */
   cameraKinds: string[];
+  /** Non-empty means the merge would destroy an archive-only trip's
+   *  only remaining copy — the backend refuses the merge outright in
+   *  this case, so the dialog must hard-block rather than warn. */
+  archiveOnlyAtRisk: ArchiveOnlyRisk[];
 }
 
 export type TimelapseMergeStrategy = "concatWherePossible" | "discardAll";
+
+export interface PruneSummary {
+  trashed: number;
+  bytesReclaimed: number;
+  sample: string[];
+}
 
 export interface MergeReport {
   primaryTripId: string;
@@ -72,6 +95,12 @@ export interface MergeReport {
   concatenated: [string, string][];
   /** Total timelapse_jobs rows removed. */
   timelapseJobsRemoved: number;
+  /** Redundant files this merge left behind (concatenated sources,
+   *  discarded outputs) that were swept to trash immediately after the
+   *  merge, scoped to just this merge's trips. `null` if the sweep
+   *  itself failed — the merge still succeeded, but these weren't
+   *  auto-cleared and need a manual Prune later. */
+  pruned: PruneSummary | null;
 }
 
 export function assessTripMerge(

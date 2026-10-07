@@ -626,6 +626,39 @@ pub fn count_orphan_timelapse_files(db: &DbHandle) -> Result<u64, AppError> {
 /// later. Not run automatically — invoked by the user via the
 /// `prune_orphan_timelapse_files` Tauri command.
 pub fn prune_orphan_timelapse_files(db: &DbHandle) -> Result<PruneSummary, AppError> {
+    sweep_orphan_files(db, None)
+}
+
+/// Same sweep as `prune_orphan_timelapse_files`, restricted to
+/// filenames whose trip_id is in `trip_ids`. Used right after a merge
+/// completes to clear the specific files that merge just made
+/// redundant, without touching unrelated orphans elsewhere in the
+/// directory (or re-walking the whole archive for a handful of files).
+pub fn prune_orphan_timelapse_files_for_trips(
+    db: &DbHandle,
+    trip_ids: &[String],
+) -> Result<PruneSummary, AppError> {
+    if trip_ids.is_empty() {
+        return Ok(PruneSummary {
+            trashed: 0,
+            bytes_reclaimed: 0,
+            sample: Vec::new(),
+        });
+    }
+    let scope: std::collections::HashSet<&str> =
+        trip_ids.iter().map(String::as_str).collect();
+    sweep_orphan_files(db, Some(&scope))
+}
+
+/// Shared implementation for `prune_orphan_timelapse_files` and its
+/// merge-scoped variant. `scope`, when set, additionally restricts
+/// candidates to filenames whose trip_id is in the set — everything
+/// else about orphan detection (UUID-shape parsing, the
+/// `timelapse_jobs`-referenced check, trashing) is identical.
+fn sweep_orphan_files(
+    db: &DbHandle,
+    scope: Option<&std::collections::HashSet<&str>>,
+) -> Result<PruneSummary, AppError> {
     let archive_root = db.archive_root().to_path_buf();
     let timelapses_dir = archive_root.join("Timelapses");
     if !timelapses_dir.is_dir() {
@@ -692,6 +725,11 @@ pub fn prune_orphan_timelapse_files(db: &DbHandle) -> Result<PruneSummary, AppEr
         let trip_id = &stem[..36];
         if !is_uuid_shape(trip_id) {
             continue;
+        }
+        if let Some(scope) = scope {
+            if !scope.contains(trip_id) {
+                continue;
+            }
         }
         if referenced.contains(trip_id) {
             continue;
@@ -1510,6 +1548,51 @@ mod tests {
         assert!(inside.exists(), "subdirectory entries must not be touched");
         assert!(summary.bytes_reclaimed > 0);
         assert_eq!(summary.sample, vec![format!("{orphan}_8x_F.mp4")]);
+
+        let _ = fs::remove_dir_all(&archive_root);
+    }
+
+    /// The merge-scoped variant must only touch orphans whose trip_id
+    /// is in the requested scope, leaving unrelated orphans elsewhere
+    /// in the directory alone — so a merge's cleanup can't accidentally
+    /// sweep up orphans from an unrelated earlier operation.
+    #[test]
+    fn prune_orphan_timelapse_files_for_trips_only_touches_scoped_ids() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let archive_root = temp_dir().join(format!("tripviewer-prune-scoped-{pid}-{n}"));
+        let _ = fs::remove_dir_all(&archive_root);
+        fs::create_dir_all(archive_root.join("Timelapses")).unwrap();
+
+        // Two orphans: one in scope (this merge's absorbed trip), one
+        // out of scope (an unrelated orphan from something else).
+        let in_scope = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let in_scope_file = archive_root
+            .join("Timelapses")
+            .join(format!("{in_scope}_8x_F.mp4"));
+        fs::write(&in_scope_file, b"in scope orphan").unwrap();
+
+        let out_of_scope = "ffffffff-1111-2222-3333-444444444444";
+        let out_of_scope_file = archive_root
+            .join("Timelapses")
+            .join(format!("{out_of_scope}_8x_F.mp4"));
+        fs::write(&out_of_scope_file, b"out of scope orphan").unwrap();
+
+        let db = crate::db::open_in_memory_with_root(&archive_root).unwrap();
+        let summary = prune_orphan_timelapse_files_for_trips(
+            &db,
+            &[in_scope.to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(summary.trashed, 1, "only the in-scope orphan should be trashed");
+        assert!(!in_scope_file.exists(), "in-scope orphan must be gone");
+        assert!(
+            out_of_scope_file.exists(),
+            "out-of-scope orphan must be left alone"
+        );
 
         let _ = fs::remove_dir_all(&archive_root);
     }

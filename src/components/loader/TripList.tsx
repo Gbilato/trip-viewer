@@ -7,6 +7,7 @@ import type { TimelapseJobRow } from "../../ipc/timelapse";
 import { TripBadges } from "../sidebar/TripBadges";
 import { TripActionsMenu } from "../trip/TripActionsMenu";
 import { MergeTripsDialog } from "../trip/MergeTripsDialog";
+import { BulkDeleteTripsDialog } from "../review/BulkDeleteTripsDialog";
 import { formatBytes, formatTripStart } from "../../utils/format";
 
 function formatDuration(trip: Trip): string {
@@ -42,12 +43,37 @@ function tripTimelapseBytes(
   return tripJobs.reduce((sum, j) => sum + (j.outputSizeBytes ?? 0), 0);
 }
 
+/** 3 tiers (8x/16x/60x) × 3 channels (F/I/R) — the full set of renders
+ *  a trip can have. Matches the fixed universe the timelapse encoder
+ *  and merge backend both key off of. */
+const TOTAL_TIMELAPSE_TUPLES = 9;
+
+/** Count of distinct (tier, channel) tuples with a `done` render for
+ *  this trip, out of `TOTAL_TIMELAPSE_TUPLES` possible. There's no
+ *  sidebar signal for this otherwise — a merge can silently cost you
+ *  finished renders with nothing here to warn you first. */
+function tripTimelapseCoverage(
+  tripId: string,
+  jobs: TimelapseJobRow[],
+): number {
+  const done = new Set<string>();
+  for (const j of jobs) {
+    if (j.tripId === tripId && j.status === "done") {
+      done.add(`${j.tier}/${j.channel}`);
+    }
+  }
+  return done.size;
+}
+
 export function TripList() {
   const trips = useStore((s) => s.trips);
   const selectedTripId = useStore((s) => s.selectedTripId);
   const selectTrip = useStore((s) => s.selectTrip);
-  const markedForMerge = useStore((s) => s.markedForMerge);
-  const clearMergeMarks = useStore((s) => s.clearMergeMarks);
+  const selectedTripIds = useStore((s) => s.selectedTripIds);
+  const toggleTripSelection = useStore((s) => s.toggleTripSelection);
+  const clearTripSelection = useStore((s) => s.clearTripSelection);
+  const deleteTripsCompletely = useStore((s) => s.deleteTripsCompletely);
+  const deleteOriginalsForTrips = useStore((s) => s.deleteOriginalsForTrips);
   const timelapseJobs = useStore((s) => s.timelapseJobs);
   const reclaimableFilter = useStore((s) => s.reclaimableFilter);
   const setReclaimableFilter = useStore((s) => s.setReclaimableFilter);
@@ -56,9 +82,17 @@ export function TripList() {
   );
   const libraryFirstLoadDone = useStore((s) => s.libraryFirstLoadDone);
   const [showMergeDialog, setShowMergeDialog] = useState(false);
+  // Bulk-delete dialog: which mode, plus a snapshot of the targeted trips
+  // captured at open time so the summary stays stable even after the
+  // store action clears the live selection on completion.
+  const [bulkMode, setBulkMode] = useState<null | "trip" | "originals">(null);
+  const [bulkTrips, setBulkTrips] = useState<Trip[]>([]);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkError, setBulkError] = useState<string | null>(null);
 
-  const markedTrips = trips.filter((t) => markedForMerge.has(t.id));
-  const canMerge = markedTrips.length >= 2;
+  const selectedTrips = trips.filter((t) => selectedTripIds.has(t.id));
+  const canMerge = selectedTrips.length >= 2;
+  const originalsSelectable = selectedTrips.filter((t) => !t.archiveOnly);
 
   const visibleTrips = useMemo(() => {
     if (!reclaimableFilter || !reclaimableIds) return trips;
@@ -118,6 +152,59 @@ export function TripList() {
     }
   }
 
+  function onRowClick(e: React.MouseEvent, tripId: string) {
+    // Shift = range from anchor; Ctrl/Cmd = toggle one into the
+    // multi-selection. preventDefault stops the browser from text-selecting
+    // row labels while range-clicking.
+    if (e.shiftKey) {
+      e.preventDefault();
+      toggleTripSelection(tripId, {
+        range: true,
+        order: visibleTrips.map((t) => t.id),
+      });
+      return;
+    }
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      toggleTripSelection(tripId);
+      return;
+    }
+    // Plain click: open the trip and collapse any multi-selection, but
+    // keep this row as the anchor so a follow-up Shift-click ranges from
+    // here.
+    useStore.setState({
+      selectedTripIds: new Set<string>(),
+      tripSelectionAnchorId: tripId,
+    });
+    void onSelectTrip(tripId);
+  }
+
+  async function onConfirmBulkDelete() {
+    if (!bulkMode) return;
+    setBulkBusy(true);
+    setBulkError(null);
+    try {
+      const ids = bulkTrips.map((t) => t.id);
+      const result =
+        bulkMode === "trip"
+          ? await deleteTripsCompletely(ids)
+          : await deleteOriginalsForTrips(ids);
+      if (result.failures.length > 0) {
+        setBulkError(
+          `${result.failures.length} of ${ids.length} ${ids.length === 1 ? "trip" : "trips"} had files that couldn't be moved to trash`,
+        );
+        // Selection is already cleared by the action; keep the dialog open
+        // on the captured snapshot so the failure stays visible.
+        return;
+      }
+      setBulkMode(null);
+    } catch (e) {
+      setBulkError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
   if (!libraryFirstLoadDone) {
     return (
       <div className="flex items-center gap-2 px-3 py-4 text-sm text-neutral-500">
@@ -156,56 +243,90 @@ export function TripList() {
           </button>
         </div>
       )}
-      {markedForMerge.size > 0 && (
-        <div
-          className={clsx(
-            "mx-2 mt-2 flex items-center gap-2 rounded-md border px-2 py-1.5 text-xs",
-            canMerge
-              ? "border-sky-700 bg-sky-950/60 text-sky-200"
-              : "border-neutral-700 bg-neutral-900 text-neutral-400",
-          )}
-        >
-          <span className="flex-1">
-            {markedForMerge.size}{" "}
-            {markedForMerge.size === 1 ? "trip" : "trips"} marked
-            {!canMerge && " · need 2+ to merge"}
-          </span>
-          <button
-            onClick={() => setShowMergeDialog(true)}
-            disabled={!canMerge}
-            className={clsx(
-              "rounded px-2 py-0.5 font-medium",
-              canMerge
-                ? "bg-sky-700 text-white hover:bg-sky-600"
-                : "cursor-not-allowed bg-neutral-800 text-neutral-500",
-            )}
-            title={
-              canMerge
-                ? "Merge the marked trips into one"
-                : "Mark at least one more trip to enable merge"
-            }
-          >
-            Merge
-          </button>
-          <button
-            onClick={() => clearMergeMarks()}
-            className="rounded px-2 py-0.5 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
-            title="Clear all marks"
-          >
-            Clear
-          </button>
+      {selectedTrips.length > 0 && (
+        <div className="mx-2 mt-2 rounded-md border border-sky-700 bg-sky-950/60 px-2 py-1.5 text-xs text-sky-200">
+          <div className="flex items-center gap-2">
+            <span className="flex-1">
+              {selectedTrips.length}{" "}
+              {selectedTrips.length === 1 ? "trip" : "trips"} selected
+            </span>
+            <button
+              onClick={() => clearTripSelection()}
+              className="rounded px-2 py-0.5 text-sky-300 hover:bg-sky-900 hover:text-sky-100"
+              title="Clear the selection"
+            >
+              Clear
+            </button>
+          </div>
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            <button
+              onClick={() => setShowMergeDialog(true)}
+              disabled={!canMerge}
+              className={clsx(
+                "rounded px-2 py-0.5 font-medium",
+                canMerge
+                  ? "bg-sky-700 text-white hover:bg-sky-600"
+                  : "cursor-not-allowed bg-neutral-800 text-neutral-500",
+              )}
+              title={
+                canMerge
+                  ? "Merge the selected trips into one"
+                  : "Select at least one more trip to enable merge"
+              }
+            >
+              Merge
+            </button>
+            <button
+              onClick={() => {
+                setBulkTrips(originalsSelectable);
+                setBulkError(null);
+                setBulkMode("originals");
+              }}
+              disabled={originalsSelectable.length === 0}
+              className={clsx(
+                "rounded px-2 py-0.5 font-medium",
+                originalsSelectable.length > 0
+                  ? "bg-amber-800 text-amber-100 hover:bg-amber-700"
+                  : "cursor-not-allowed bg-neutral-800 text-neutral-500",
+              )}
+              title={
+                originalsSelectable.length > 0
+                  ? "Trash the source files, keep the timelapse archives"
+                  : "No selected trip still has originals to delete"
+              }
+            >
+              Delete originals…
+            </button>
+            <button
+              onClick={() => {
+                setBulkTrips(selectedTrips);
+                setBulkError(null);
+                setBulkMode("trip");
+              }}
+              className="rounded bg-red-800 px-2 py-0.5 font-medium text-red-100 hover:bg-red-700"
+              title="Trash originals and timelapse archives, remove the trips"
+            >
+              Delete trips…
+            </button>
+          </div>
         </div>
       )}
 
-      <ul className="flex flex-col gap-1 overflow-y-auto p-2">
+      {/* Extra right padding reserves a gutter for the scroll container's
+          scrollbar so the per-row kebab (right-1) sits clear of the
+          scrollbar track and can't be clicked through it by accident. */}
+      <ul className="flex flex-col gap-1 overflow-y-auto py-2 pl-2 pr-4 [scrollbar-gutter:stable]">
         {visibleTrips.map((trip) => {
           const active = trip.id === selectedTripId;
           const archive = trip.archiveOnly === true;
-          const marked = markedForMerge.has(trip.id);
+          const selected = selectedTripIds.has(trip.id);
           const archiveBytes = archive
             ? tripTimelapseBytes(trip.id, timelapseJobs)
             : null;
           const originalsBytes = archive ? null : tripOriginalsBytes(trip);
+          const timelapseCoverage = archive
+            ? null
+            : tripTimelapseCoverage(trip.id, timelapseJobs);
           return (
             <li key={trip.id}>
               <div
@@ -214,15 +335,14 @@ export function TripList() {
                   active
                     ? "bg-neutral-700 text-white"
                     : "text-neutral-300 hover:bg-neutral-800",
-                  // Marked trips get a sky-blue ring so the user can
-                  // see the selection at a glance, even as they scroll
-                  // away from the kebab they used to mark.
-                  marked && "ring-1 ring-inset ring-sky-500",
+                  // Multi-selected trips get a sky-blue ring so the user
+                  // can see the group selection at a glance while scrolling.
+                  selected && "ring-1 ring-inset ring-sky-500",
                 )}
               >
                 <button
-                  onClick={() => void onSelectTrip(trip.id)}
-                  className="flex-1 px-3 py-2 text-left text-sm"
+                  onClick={(e) => onRowClick(e, trip.id)}
+                  className="flex-1 select-none px-3 py-2 text-left text-sm"
                 >
                   <div className="flex items-center gap-2 pr-7 font-medium">
                     <span>{formatTripStart(trip.startTime)}</span>
@@ -234,12 +354,20 @@ export function TripList() {
                         Archive
                       </span>
                     )}
-                    {marked && (
+                    {timelapseCoverage != null && timelapseCoverage > 0 && (
                       <span
                         className="rounded-sm bg-sky-900/60 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-200"
-                        title="Marked for merge"
+                        title={`${timelapseCoverage} of ${TOTAL_TIMELAPSE_TUPLES} possible timelapse renders done. Merging this trip with another may delete finished renders if their coverage doesn't match.`}
                       >
-                        Merge
+                        Timelapse {timelapseCoverage}/{TOTAL_TIMELAPSE_TUPLES}
+                      </span>
+                    )}
+                    {selected && (
+                      <span
+                        className="rounded-sm bg-sky-900/60 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-200"
+                        title="Selected"
+                      >
+                        ✓
                       </span>
                     )}
                   </div>
@@ -261,8 +389,20 @@ export function TripList() {
 
       {showMergeDialog && canMerge && (
         <MergeTripsDialog
-          marked={markedTrips}
+          marked={selectedTrips}
           onClose={() => setShowMergeDialog(false)}
+        />
+      )}
+      {bulkMode && bulkTrips.length > 0 && (
+        <BulkDeleteTripsDialog
+          trips={bulkTrips}
+          mode={bulkMode}
+          busy={bulkBusy}
+          errorMessage={bulkError}
+          onCancel={() => {
+            if (!bulkBusy) setBulkMode(null);
+          }}
+          onConfirm={() => void onConfirmBulkDelete()}
         />
       )}
     </>

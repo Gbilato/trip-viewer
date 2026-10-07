@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { useStore } from "../../state/store";
 import type { Trip } from "../../types/model";
@@ -24,13 +24,15 @@ export function TripActionsMenu({ trip, variant = "kebab" }: Props) {
   const [showDeleteTrip, setShowDeleteTrip] = useState(false);
   const [busy, setBusy] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // When the trip row sits near the bottom of the viewport, dropping the
+  // popover down would paint it below the window. Flip it above the button
+  // in that case (decided on open from the button's measured position).
+  const [dropUp, setDropUp] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
 
   const deleteOriginalsForTrip = useStore((s) => s.deleteOriginalsForTrip);
   const deleteTripCompletely = useStore((s) => s.deleteTripCompletely);
-  const markedForMerge = useStore((s) => s.markedForMerge);
-  const toggleMarkForMerge = useStore((s) => s.toggleMarkForMerge);
-  const isMarked = markedForMerge.has(trip.id);
 
   // Close popover on outside click. Pointerdown so it races ahead of
   // re-renders triggered by inner clicks.
@@ -44,6 +46,18 @@ export function TripActionsMenu({ trip, variant = "kebab" }: Props) {
     }
     document.addEventListener("pointerdown", onPointer);
     return () => document.removeEventListener("pointerdown", onPointer);
+  }, [open]);
+
+  // Choose drop direction before paint so the menu never flashes in the
+  // wrong place. ~180px covers the tallest variant (three two-line items).
+  useLayoutEffect(() => {
+    if (!open) return;
+    const btn = buttonRef.current;
+    if (!btn) return;
+    const rect = btn.getBoundingClientRect();
+    const estimatedMenuHeight = 180;
+    const spaceBelow = window.innerHeight - rect.bottom;
+    setDropUp(spaceBelow < estimatedMenuHeight && rect.top > spaceBelow);
   }, [open]);
 
   const archive = trip.archiveOnly === true;
@@ -101,6 +115,7 @@ export function TripActionsMenu({ trip, variant = "kebab" }: Props) {
     <>
       <div ref={menuRef} className="relative inline-block">
         <button
+          ref={buttonRef}
           onClick={(e) => {
             e.stopPropagation();
             setOpen((o) => !o);
@@ -116,23 +131,12 @@ export function TripActionsMenu({ trip, variant = "kebab" }: Props) {
         </button>
         {open && (
           <div
-            className="absolute right-0 top-full z-20 mt-1 min-w-[12rem] rounded-md border border-neutral-700 bg-neutral-900 py-1 shadow-lg"
+            className={clsx(
+              "absolute right-0 z-20 min-w-[12rem] rounded-md border border-neutral-700 bg-neutral-900 py-1 shadow-lg",
+              dropUp ? "bottom-full mb-1" : "top-full mt-1",
+            )}
             onClick={(e) => e.stopPropagation()}
           >
-            <button
-              onClick={() => {
-                setOpen(false);
-                toggleMarkForMerge(trip.id);
-              }}
-              className="block w-full border-b border-neutral-800 px-3 py-1.5 text-left text-sm text-neutral-200 hover:bg-neutral-800"
-            >
-              {isMarked ? "Unmark for merge" : "Mark for merge"}
-              <div className="text-[11px] text-neutral-500">
-                {isMarked
-                  ? "Remove from the merge selection"
-                  : "Mark this trip; mark another to enable join"}
-              </div>
-            </button>
             {!archive && (
               <button
                 onClick={() => {

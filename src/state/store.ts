@@ -227,21 +227,42 @@ export interface AppState
   /** Toggle the reclaimable-only filter in the sidebar trip list. */
   setReclaimableFilter: (enabled: boolean) => void;
 
-  /** IDs of trips the user has flagged for merging. Session-scoped —
-   *  not persisted to disk. Once `markedForMerge.size >= 2`, the
-   *  TripList sidebar shows a "Merge marked trips" banner. The mark
-   *  is cleared after a successful merge or on explicit cancel. */
-  markedForMerge: Set<string>;
-  toggleMarkForMerge: (tripId: string) => void;
-  clearMergeMarks: () => void;
-  /** Read-only assessment of what's possible for the marked trips'
-   *  existing timelapse outputs. Returns null when nothing is marked
-   *  or only one is marked (need 2+ for a merge). */
+  /** IDs of trips the user has multi-selected in the sidebar via
+   *  Ctrl/Cmd-click (toggle one) or Shift-click (range). Session-scoped —
+   *  not persisted to disk. Drives the selection toolbar's group actions
+   *  (merge, bulk delete). Cleared after a successful group action, on
+   *  explicit "Clear", or when a plain click opens a single trip. */
+  selectedTripIds: Set<string>;
+  /** Anchor row for Shift-click range selection in the trip list. */
+  tripSelectionAnchorId: string | null;
+  /** Toggle a trip's membership in the multi-selection. Pass
+   *  `range:true` with the current visible `order` (trip ids top-to-bottom)
+   *  to select the span from `tripSelectionAnchorId` through `tripId`
+   *  inclusive. Range always *adds* — never deselects. */
+  toggleTripSelection: (
+    tripId: string,
+    options?: { range?: boolean; order?: string[] },
+  ) => void;
+  clearTripSelection: () => void;
+  /** Bulk "Delete originals…" across the selected trips. Trashes source
+   *  files but keeps timelapse archives. Clears the selection on completion
+   *  and returns the per-trip failures so the dialog can surface them. */
+  deleteOriginalsForTrips: (
+    tripIds: string[],
+  ) => Promise<{ failures: { tripId: string; message: string }[] }>;
+  /** Bulk "Delete trip…" across the selected trips. Trashes originals AND
+   *  timelapse archives, removing the trips from the library. */
+  deleteTripsCompletely: (
+    tripIds: string[],
+  ) => Promise<{ failures: { tripId: string; message: string }[] }>;
+  /** Read-only assessment of what's possible for the selected trips'
+   *  existing timelapse outputs. Returns null when nothing is selected
+   *  or only one is selected (need 2+ for a merge). */
   assessMergeMarked: () => Promise<TimelapseMergeAssessment | null>;
   /** Perform the merge. Returns the backend report. The primary is
-   *  chosen as the earliest-starting marked trip (its segments come
+   *  chosen as the earliest-starting selected trip (its segments come
    *  first in the merged timeline). On success, the in-memory trip
-   *  list is rewritten to reflect the merge and `markedForMerge` is
+   *  list is rewritten to reflect the merge and `selectedTripIds` is
    *  cleared. */
   mergeMarkedTrips: (strategy: TimelapseMergeStrategy) => Promise<MergeReport>;
 
@@ -291,7 +312,8 @@ export const useStore = create<AppState>((set) => ({
   librarySummary: null,
   reclaimableFilter: false,
   libraryFirstLoadDone: false,
-  markedForMerge: new Set<string>(),
+  selectedTripIds: new Set<string>(),
+  tripSelectionAnchorId: null,
 
   loadedTripId: null,
   activeSegmentId: null,
@@ -614,24 +636,98 @@ export const useStore = create<AppState>((set) => ({
     }
   },
 
-  toggleMarkForMerge: (tripId) =>
+  toggleTripSelection: (tripId, options) =>
     useStore.setState((s) => {
-      const next = new Set(s.markedForMerge);
+      const next = new Set(s.selectedTripIds);
+      if (options?.range && s.tripSelectionAnchorId && options.order) {
+        // Shift-click range: select every trip between the anchor and the
+        // clicked one (inclusive) in the *visible* order passed by the
+        // list. Always adds — never deselects — so a stray shift-click
+        // can't wipe an existing selection.
+        const order = options.order;
+        const anchorIdx = order.indexOf(s.tripSelectionAnchorId);
+        const clickedIdx = order.indexOf(tripId);
+        if (anchorIdx >= 0 && clickedIdx >= 0) {
+          const lo = Math.min(anchorIdx, clickedIdx);
+          const hi = Math.max(anchorIdx, clickedIdx);
+          for (let i = lo; i <= hi; i++) next.add(order[i]);
+          return { selectedTripIds: next, tripSelectionAnchorId: tripId };
+        }
+      }
+      // Plain toggle (Ctrl/Cmd-click): flip this one, set it as the new
+      // anchor for any subsequent shift-click range.
       if (next.has(tripId)) next.delete(tripId);
       else next.add(tripId);
-      return { markedForMerge: next };
+      return { selectedTripIds: next, tripSelectionAnchorId: tripId };
     }),
 
-  clearMergeMarks: () => useStore.setState({ markedForMerge: new Set() }),
+  clearTripSelection: () =>
+    useStore.setState({
+      selectedTripIds: new Set<string>(),
+      tripSelectionAnchorId: null,
+    }),
+
+  deleteOriginalsForTrips: async (tripIds) => {
+    const failures: { tripId: string; message: string }[] = [];
+    // Sequential — each trip's delete optimistically rewrites the trip
+    // list, and running them serially keeps those updates from racing.
+    for (const tripId of tripIds) {
+      try {
+        const report =
+          await useStore.getState().deleteOriginalsForTrip(tripId);
+        if (report.failures.length > 0) {
+          failures.push({
+            tripId,
+            message:
+              report.failures.length === 1
+                ? report.failures[0].message
+                : `${report.failures.length} files could not be moved to trash`,
+          });
+        }
+      } catch (e) {
+        failures.push({
+          tripId,
+          message: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+    useStore.getState().clearTripSelection();
+    return { failures };
+  },
+
+  deleteTripsCompletely: async (tripIds) => {
+    const failures: { tripId: string; message: string }[] = [];
+    for (const tripId of tripIds) {
+      try {
+        const report = await useStore.getState().deleteTripCompletely(tripId);
+        if (report.failures.length > 0) {
+          failures.push({
+            tripId,
+            message:
+              report.failures.length === 1
+                ? report.failures[0].message
+                : `${report.failures.length} files could not be moved to trash`,
+          });
+        }
+      } catch (e) {
+        failures.push({
+          tripId,
+          message: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+    useStore.getState().clearTripSelection();
+    return { failures };
+  },
 
   assessMergeMarked: async () => {
     const state = useStore.getState();
-    if (state.markedForMerge.size < 2) return null;
+    if (state.selectedTripIds.size < 2) return null;
     // Earliest-start wins — the resulting merged trip's UUID matches
     // the natural earliest trip's, so its segments come first in any
     // chronological view and the player resumes there naturally.
     const marked: Trip[] = state.trips.filter((t) =>
-      state.markedForMerge.has(t.id),
+      state.selectedTripIds.has(t.id),
     );
     marked.sort((a, b) => a.startTime.localeCompare(b.startTime));
     const primaryId = marked[0]?.id;
@@ -642,11 +738,11 @@ export const useStore = create<AppState>((set) => ({
 
   mergeMarkedTrips: async (strategy) => {
     const state = useStore.getState();
-    if (state.markedForMerge.size < 2) {
-      throw new Error("Need at least 2 trips marked to merge");
+    if (state.selectedTripIds.size < 2) {
+      throw new Error("Need at least 2 trips selected to merge");
     }
     const marked: Trip[] = state.trips.filter((t) =>
-      state.markedForMerge.has(t.id),
+      state.selectedTripIds.has(t.id),
     );
     marked.sort((a, b) => a.startTime.localeCompare(b.startTime));
     const primaryId = marked[0].id;
@@ -703,7 +799,8 @@ export const useStore = create<AppState>((set) => ({
           : s.loadedTripId;
       return {
         trips: nextTrips,
-        markedForMerge: new Set<string>(),
+        selectedTripIds: new Set<string>(),
+        tripSelectionAnchorId: null,
         timelapseJobs: nextJobs,
         selectedTripId: nextSelected,
         loadedTripId: nextLoaded,

@@ -55,6 +55,26 @@ const WATCHDOG_STALL_MS = 1500;
 const WATCHDOG_COOLDOWN_MS = 1500;
 const ENABLE_STALL_WATCHDOG = SKIP_DRIFT_CORRECTION;
 
+// Coarse drift re-anchor for the same WebKit-based pipelines that need
+// SKIP_DRIFT_CORRECTION. The per-frame correction in start()'s tick is
+// disabled there because a `currentTime=` is a full pipeline flush, and
+// per-frame seeks thrash the compositor. But *no* correction lets a long
+// single-file tier accumulate unbounded drift: slaves free-run with no
+// segment boundary to re-anchor them, and every watchdog kick (pause→
+// play, no seek) bakes in a fixed offset that nothing ever removes —
+// observed as channels drifting *minutes* apart over a multi-hour
+// timelapse. So on a slow timer we re-anchor any slave that has drifted
+// past REANCHOR_DRIFT_S back to its correct file-time, and resume any
+// that should be playing but isn't (e.g. a slave whose play() rejected at
+// start). The coarse cadence, large threshold, and per-slave cooldown
+// keep this from re-creating the flush-thrash loop the per-frame path
+// caused. REANCHOR_DRIFT_S is the main tuning knob — verify with the
+// drift HUD and tighten if visible offset is still too large.
+const REANCHOR_INTERVAL_MS = 1000;
+const REANCHOR_DRIFT_S = 0.5;
+const REANCHOR_COOLDOWN_MS = 2000;
+const ENABLE_DRIFT_REANCHOR = SKIP_DRIFT_CORRECTION;
+
 interface WatchdogEntry {
   /** Last sampled `currentTime` for this video. */
   lastTime: number;
@@ -129,6 +149,7 @@ export class SyncEngine {
     this.attachPauseGuard();
     this.attachTimeUpdate();
     this.attachStallWatchdog();
+    this.attachSlaveReconciler();
     this.attachGapCheck();
   }
 
@@ -382,22 +403,90 @@ export class SyncEngine {
       });
   }
 
+  // See the ENABLE_DRIFT_REANCHOR comment. Slow-timer reconciler that
+  // keeps slaves aligned with — and playing alongside — the master on
+  // WebKit-based pipelines, where per-frame correction is off. No-op
+  // elsewhere (Chromium corrects per frame in start()'s tick).
+  private attachSlaveReconciler(): void {
+    if (!ENABLE_DRIFT_REANCHOR) return;
+    const lastActionAt = new WeakMap<HTMLVideoElement, number>();
+    const handle = setInterval(() => {
+      if (this.disposed) return;
+      if (!useStore.getState().isPlaying) return;
+      if (this.master.readyState < 2 || this.master.paused) return;
+      const masterT = this.master.currentTime;
+      const now = performance.now();
+      // Master file-time → concat-time, so curved slaves can be mapped to
+      // their own axis below (mirrors seek()). Null when there's no curve
+      // (Original mode): every slave then shares the master's file-time.
+      const concatT =
+        this.masterCurve && this.masterCurve.length > 0
+          ? fileToConcat(masterT, this.masterCurve)
+          : null;
+      for (let i = 0; i < this.slaves.length; i++) {
+        const slave = this.slaves[i];
+        // A slave held in a coverage gap must stay paused/black — the gap
+        // loop owns it. Skip.
+        if (this.slaveInGap[i]) continue;
+        if (slave.readyState < 2 || slave.ended) continue;
+
+        // Resolve this slave's correct file-time for the master's current
+        // position. A curved slave lives on its own axis (gap-closed
+        // and/or a per-channel speed curve), so map through its curve
+        // exactly as seek() does; a curveless slave (Original mode, or a
+        // full-coverage channel with no curve) shares the master file-time.
+        const curve = this.slaveCurves[i];
+        let target = masterT;
+        if (curve && curve.length > 0 && concatT !== null) {
+          const cov = coverageAt(concatT, curve);
+          // Not covered here → it's entering a gap the gap loop hasn't
+          // processed yet; leave it alone rather than fight that.
+          if (!cov.covered || !Number.isFinite(cov.fileTime)) continue;
+          target = cov.fileTime;
+        }
+
+        const drift = Math.abs(slave.currentTime - target);
+        const needsResume = slave.paused;
+        if (!needsResume && drift <= REANCHOR_DRIFT_S) continue;
+        // One action per slave per cooldown window — never a per-tick
+        // storm that would re-create the thrash loop SKIP_DRIFT_CORRECTION
+        // exists to avoid.
+        if (now - (lastActionAt.get(slave) ?? 0) < REANCHOR_COOLDOWN_MS)
+          continue;
+        lastActionAt.set(slave, now);
+        if (drift > REANCHOR_DRIFT_S) slave.currentTime = target;
+        if (needsResume) slave.play().catch(() => {});
+      }
+    }, REANCHOR_INTERVAL_MS);
+    this.cleanups.push(() => clearInterval(handle));
+  }
+
   async play(): Promise<void> {
     this.pauseIntentional = false;
     try {
       const speed = useStore.getState().speed;
       this.master.playbackRate = speed;
       this.slaves.forEach((s) => (s.playbackRate = speed));
+      // The MASTER is the source of truth for "is the trip playing." Mark
+      // the store playing as soon as the master starts — do NOT gate it on
+      // the slaves. On WebKit-based pipelines a wedged slave's play() can
+      // reject; if we awaited all slaves (Promise.all) before
+      // setIsPlaying(true), a single rejection would skip it entirely,
+      // leaving the store paused while the master plays — the Play button
+      // reads "Play" yet does nothing, and every later seek() refuses to
+      // resume the slaves (it only plays them when store.isPlaying). The
+      // slave reconciler recovers a slave that failed to start here.
       await this.master.play();
-      // Don't un-pause a slave that's currently held in a coverage gap —
-      // it must stay paused (black) until its gap ends. The gap loop
-      // resumes it on the covered transition.
-      await Promise.all(
+      useStore.getState().setIsPlaying(true);
+      // Slaves are best-effort: allSettled so one rejection can't throw.
+      // Don't un-pause a slave held in a coverage gap — it must stay black
+      // until its gap ends; the gap loop resumes it on the covered
+      // transition.
+      await Promise.allSettled(
         this.slaves.map((s, i) =>
           this.slaveInGap[i] ? Promise.resolve() : s.play(),
         ),
       );
-      useStore.getState().setIsPlaying(true);
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") return;
       console.error("SyncEngine.play failed:", e);
