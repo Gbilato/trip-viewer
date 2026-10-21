@@ -93,6 +93,9 @@ pub fn extract_for_kind(path: &Path, kind: CameraKind) -> Result<Vec<GpsPoint>, 
         // data at all). If a GPS-equipped Thinkware model turns up, add a
         // decoder and flip `CameraKind::gps_supported` for that variant.
         CameraKind::Thinkware => Ok(vec![]),
+        // 70mai: GPS format not reverse-engineered yet. Add a decoder and
+        // flip `CameraKind::gps_supported` once someone shares a sample.
+        CameraKind::Mai70 => Ok(vec![]),
         // Generic fallback: try Wolf Box's decoder as a best-guess since
         // the ShenShu meta-track layout is the only one we know, but log
         // that we're guessing. Often this will just return an empty vec.
