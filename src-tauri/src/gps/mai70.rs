@@ -103,6 +103,17 @@ pub fn extract(path: &Path) -> Result<Vec<GpsPoint>, AppError> {
 
         let lat = nmea_to_degrees(lat_raw);
         let lon = nmea_to_degrees(lon_raw);
+
+        // No fix (status != 'A', all-zero position while the receiver is
+        // still acquiring, out-of-range values): drop the point instead of
+        // emitting it. The map and the stitched trip track draw every point
+        // they get, so a (0, 0) point would pull the route to the Gulf of
+        // Guinea. This matches the other decoders, which only emit usable
+        // positions.
+        if !(fix && in_range(lat, lon)) {
+            continue;
+        }
+
         let heading = le_i32(&head, OFF_HEADING);
         let speed_kmh = le_i32(&head, OFF_SPEED_KMH);
 
@@ -113,7 +124,7 @@ pub fn extract(path: &Path) -> Result<Vec<GpsPoint>, AppError> {
             speed_mps: speed_kmh.max(0) as f64 * KMH_TO_MPS,
             heading_deg: if (0..360).contains(&heading) { heading as f64 } else { 0.0 },
             altitude_m: 0.0,
-            fix_ok: fix && in_range(lat, lon),
+            fix_ok: true,
         });
     }
 
@@ -439,20 +450,32 @@ mod tests {
     }
 
     #[test]
-    fn void_fix_is_flagged() {
+    fn void_fix_is_skipped() {
         let s = sample(b'V', 453_000_000, 103_000_000, 0, 0);
         let clip = write_clip(b"hint", &[s], 1000);
-        let pts = extract(clip.path()).unwrap();
-        assert_eq!(pts.len(), 1);
-        assert!(!pts[0].fix_ok);
+        assert!(extract(clip.path()).unwrap().is_empty());
     }
 
     #[test]
-    fn zero_position_is_not_a_fix() {
+    fn zero_position_is_skipped() {
         let s = sample(b'A', 0, 0, 0, 0);
         let clip = write_clip(b"hint", &[s], 1000);
+        assert!(extract(clip.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn leading_no_fix_samples_do_not_shift_valid_times() {
+        // 4 frames over 4 s: two with no position yet, then two valid
+        // updates. Only the valid ones come out, with their true times.
+        let none = sample(b'A', 0, 0, 0, 0);
+        let a = sample(b'A', 453_000_000, 103_000_000, 0, 0);
+        let b = sample(b'A', 453_030_000, 103_030_000, 0, 0);
+        let clip = write_clip(b"hint", &[none.clone(), none, a, b], 4000);
         let pts = extract(clip.path()).unwrap();
-        assert!(!pts[0].fix_ok);
+        assert_eq!(pts.len(), 2);
+        assert!((pts[0].t_offset_s - 2.0).abs() < 1e-9);
+        assert!((pts[1].t_offset_s - 3.0).abs() < 1e-9);
+        assert!(pts.iter().all(|p| p.fix_ok && p.lat > 0.0));
     }
 
     #[test]
