@@ -45,9 +45,9 @@ impl CameraKind {
             CameraKind::WolfBox => true,
             CameraKind::Miltona => true,
             CameraKind::Thinkware => false,
-            // 70mai embeds GPS in a format we haven't decoded yet. Hide the
-            // map panel rather than show a misleading "No GPS data" box.
-            CameraKind::Mai70 => false,
+            // 70mai: GPS decoded from the per-frame telemetry track
+            // (see `gps/mai70.rs`).
+            CameraKind::Mai70 => true,
             // Unknown cameras: optimistically try — we'll get empty points
             // if there's nothing to extract and the UI will show "No GPS data"
             // (which correctly reflects our uncertainty).
